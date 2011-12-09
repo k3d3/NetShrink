@@ -94,21 +94,37 @@ conn_sock = None
 
 class Connection:
     def __init__(self, sock, addr, peer_name, peer_public_key, peer_dhpk):
+        global config
         self.sock = sock
         self.addr = addr
         self.peer_name = peer_name
         self.peer_public_key = peer_public_key
-        self.peer_dhpk = peer_dhpk
         self.name, self.public_key, self.secret_key = load_identity()
-        self.dhpk, self.dhsk = crypto_box_keypair()
+        dhpk, dhsk = crypto_box_keypair()
+        self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
+        self.mac_bytes = config.getint("netshrink","mac_bytes")
+        if self.mac_bytes > 32:
+            self.mac_bytes = 32
+        self.nonce_bytes = config.getint("netshrink","nonce_bytes")
+        if self.nonce_bytes > 31:
+            self.nonce_bytes = 31
+        self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+                                                        "nonce_prefix"),
+                                             self.key)[:31-nonce_bytes]
         authpkt = '\0'
         authpkt += self.name + '\0'
         authpkt += nacl.crypto_sign(self.dhpk, self.secret_key)
         c_sendto(self.sock, authpkt, self.addr)
-        
+    
     def raw_recv(self, data):
-        pass ''' CONTINUE HERE '''
-        
+        if self.mac_bytes > 0:
+            mac = data[:selfmac_bytes]
+            if nacl.crypto_auth(data[self.mac_bytes:],
+                                self.key)[:self.mac_bytes] == mac:
+                nonce = '\x01' + self.nonce_prefix # 1 from client, 0 from server
+                nonce += data[mac_bytes:mac_bytes+nonce_bytes]
+                self.recv(nacl.crypto_stream_xor(
+    
     def recv(self, data):
         pass
 
