@@ -12,6 +12,7 @@ import nacl
 
 DEF_PORT=24414
 IDENTITY_FILE = ".identity"
+WHITELIST_FILE = ".whitelist"
 PEER_FILE = ".peers"
 
 def identity_exists():
@@ -51,13 +52,13 @@ def new_key_interface():
     save_identity(name, public_key, secret_key)
     return name, public_key, secret_key
     
-def peer_exists(peer_name):
+def peer_exists(peer_name, pfile=PEER_FILE):
     peers = configparser.RawConfigParser()
     if peers.read(PEER_FILE) == []:
         return False
     return peers.has_section(peer_name)
 
-def save_peer(peer_name, peer_public_key):
+def save_peer(peer_name, peer_public_key, pfile=PEER_FILE):
     peers = configparser.RawConfigParser()
     peers.read(PEER_FILE)
     try:
@@ -140,13 +141,13 @@ def getpeer(address="0.0.0.0",port=DEF_PORT):
         peer_name = data[33:]
         print("Peer identity is \"%s %s\"" % \
               (peer_name, get_fingerprint(peer_public_key)))
-        if peer_exists(peer_name):
+        if peer_exists(peer_name, pfile=WHITELIST_FILE):
             print("WARNING: Peer already exists. Saving this peer will"
                   " overwrite the existing key!")
         choice = raw_input("Do you want to save this peer (yes/no)? ")
         while True:
             if choice == "yes":
-                save_peer(peer_name, peer_public_key)
+                save_peer(peer_name, peer_public_key, pfile=WHITELIST_FILE)
                 print("Peer saved.")
                 break
             elif choice == "no":
