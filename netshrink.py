@@ -95,9 +95,6 @@ def addpeer(address, port=DEF_PORT):
         if data[0] != '\x02': # getpeer packet
             print("Garbage packet ignored from %s" % addr[0])
             continue
-        if addr != (address, port):
-            print("Ignoring packet from %s" % addr[0])
-            continue
         print("Got identity from %s" % addr[0])
         peer_public_key = data[1:33]
         peer_name = data[33:]
