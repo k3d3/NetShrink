@@ -161,7 +161,7 @@ def getpeer(address="0.0.0.0",port=DEF_PORT):
     sys.exit(1)
 
 def help():
-    print("%s help\n%s"%(sys.argv[0],helptext))
+    print("%s help\nTo be created" % sys.argv[0])
     sys.exit(0)
 
 if __name__ == '__main__':
