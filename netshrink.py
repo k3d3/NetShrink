@@ -3,6 +3,7 @@
 import os
 import sys
 import socket
+import struct
 import atexit
 from base64 import b64encode, b64decode
 from binascii import hexlify
@@ -101,17 +102,25 @@ class ServeConnection:
         self.peer_name = peer_name
         self.peer_public_key = peer_public_key
         self.name, self.public_key, self.secret_key = load_identity()
-        dhpk, dhsk = nacl.crypto_box_keypair()
-        self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
+        dhpk, self.dhsk = nacl.crypto_box_keypair()
+        self.kex_init = False
+        self.key = nacl.crypto_scalarmult(self.dhsk, peer_dhpk)
+        self.dhsk = None
         self.mac_bytes = config.getint("netshrink","mac_bytes")
         if self.mac_bytes > 32:
             self.mac_bytes = 32
         self.nonce_bytes = config.getint("netshrink","nonce_bytes")
-        if self.nonce_bytes > 31:
-            self.nonce_bytes = 31
-        self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
-                                                        "nonce_prefix"),
-                                             self.key)[:31-self.nonce_bytes]
+        if self.nonce_bytes > 8:
+            self.nonce_bytes = 8
+        if self.nonce_bytes:
+            self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+                                                            "nonce_prefix"),
+                                             self.key)[:23-self.nonce_bytes]
+        else:
+            self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+                                                            "nonce_prefix"),
+                                                 self.key)[:23]
+        self.nonce = 0
         authpkt = '\0'
         authpkt += self.name + '\0'
         authpkt += nacl.crypto_sign(dhpk, self.secret_key)
@@ -119,39 +128,104 @@ class ServeConnection:
     
     def raw_recv(self, data):
         if self.mac_bytes > 0:
-            mac = data[:selfmac_bytes]
+            mac = data[:self.mac_bytes]
             if not nacl.crypto_auth(data[self.mac_bytes:],
                                 self.key)[:self.mac_bytes] == mac:
-                print "Failed verification on MAC"
+                print "Failed MAC verification"
                 return
+        if self.nonce_bytes:
+            nonce_in = data[self.mac_bytes:self.mac_bytes+self.nonce_bytes]
+        else:
+            nonce_in = ''
+        #if nonce_in == '\0' * self.nonce_bytes:   
+            #print("Key re-exchange time! In")
+            #self.key_get_exchange(data[self.mac_bytes+self.nonce_bytes:])
+            # Disabled because I am incompetent at key re-exchanges
+            #return
         nonce = '\x01' + self.nonce_prefix # 1 if client, 0 if server
-        nonce += data[mac_bytes:mac_bytes+nonce_bytes]
-        in_data = data[mac_bytes+nonce_bytes:]
+        nonce += data[self.mac_bytes:self.mac_bytes+self.nonce_bytes]
+        in_data = data[self.mac_bytes+self.nonce_bytes:]
         self.recv(nacl.crypto_stream_xor(in_data, nonce, self.key))
     
     def recv(self, data):
-        print "Received data from %s: \"%s\"" % (self.peer_name, data)
+        print "Received data from %s: %s" % (self.peer_name, repr(data))
+
+    def send(self, data):
+        if self.nonce_bytes:
+            self.nonce += 1
+            nonce_out = struct.pack("!Q", self.nonce)[-self.nonce_bytes:]
+        else:
+            nonce_out = ''
+        crypted_data = nonce_out + nacl.crypto_stream_xor(data,
+                              '\x00' + self.nonce_prefix + nonce_out, self.key)
+        mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
+        c_sendto(self.sock, mac + crypted_data, self.addr)
+        if nonce_out == '\xff' * self.nonce_bytes: # wrap around
+            self.nonce = 0 #nonce 0 should only be used for key exchanges
+            #print("Key re-exchange time! Out")
+            #self.key_exchange()
+            # Disabled because I am incompetent at key re-exchanges
+
+    def key_exchange(self):
+        self.peer_nonce = 0
+        self.kex_init = True
+        nonce_out = '\0' * self.nonce_bytes
+        dhpk, self.dhsk = nacl.crypto_box_keypair()
+        authpkt = nacl.crypto_sign(dhpk, self.secret_key)
+        crypted_data = nonce_out + nacl.crypto_stream_xor(authpkt,
+                              '\0' + self.nonce_prefix + nonce_out, self.key)
+        mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
+        c_sendto(self.sock, mac + crypted_data, self.addr)
+        
+    def key_get_exchange(self, data):
+        nonce = '\0' * self.nonce_bytes
+        authpkt = nacl.crypto_stream_xor(data,
+                                         '\x01' + self.nonce_prefix + nonce,
+                                         self.key)
+        try:
+            peer_dhpk = nacl.crypto_sign_open(authpkt, self.peer_public_key)
+        except Exception:
+            print("Invalid signature from peer \"%s\" from %s" % \
+                                                               (name, addr[0]))
+            sys.exit(0)
+        if self.kex_init:
+            self.key = nacl.crypto_scalarmult(self.dhsk, peer_dhpk)
+            print("New key is %s"%repr(self.key))
+            self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+                                                        "nonce_prefix"),
+                                                self.key)[:23-self.nonce_bytes]
+            self.dhsk = None
+            self.kex_init = False
+            return
+        dhpk, dhsk = nacl.crypto_box_keypair()
+        authpkt = nacl.crypto_sign(dhpk, self.secret_key)
+        crypted_data = nonce + nacl.crypto_stream_xor(authpkt,
+                                '\0' + self.nonce_prefix + nonce, self.key)
+        mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
+        c_sendto(self.sock, mac + crypted_data, self.addr)
+        self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
+        print("New key is %s"%repr(self.key))
 
 class Connection:
     def __init__(self, sock, addr):
         self.sock = sock
         self.addr = addr
         self.name, self.public_key, self.secret_key = load_identity()
-        dhpk, dhsk = nacl.crypto_box_keypair()
+        dhpk, self.dhsk = nacl.crypto_box_keypair()
         self.mac_bytes = config.getint("netshrink","mac_bytes")
         if self.mac_bytes > 32:
             self.mac_bytes = 32
         self.nonce_bytes = config.getint("netshrink","nonce_bytes")
-        if self.nonce_bytes > 31:
-            self.nonce_bytes = 31
+        if self.nonce_bytes > 8:
+            self.nonce_bytes = 8
+        self.nonce = 0
+        self.peer_nonce = 0
+        self.kex_init = False
         authpkt = '\0' + self.name + '\0'
         authpkt += nacl.crypto_sign(dhpk, self.secret_key)
         c_sendto(self.sock, authpkt, self.addr)
         while True:
             data, inaddr = c_recvfrom(self.sock, 4096)
-            if inaddr != addr:
-                print("Ignoring data from %s" % inaddr[0])
-                continue
             if data[0] != '\0':
                 print("Ignoring garbage data from %s" % inaddr[0])
                 continue
@@ -173,10 +247,100 @@ class Connection:
             break
         print("Accepted connection from peer \"%s\" from %s" % \
                                                      (self.peer_name, addr[0]))
-        self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
-        self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+        self.key = nacl.crypto_scalarmult(self.dhsk, peer_dhpk)
+        self.dhsk = None
+        if self.nonce_bytes:
+            self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+                                                            "nonce_prefix"),
+                                             self.key)[:23-self.nonce_bytes]
+        else:
+            self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
+                                                            "nonce_prefix"),
+                                                 self.key)[:23]
+        print("len of nonce_prefix is %d"%len(self.nonce_prefix))
+        for i in xrange(260):
+            self.send("Hello there")
+
+    def raw_recv(self, data):
+        if self.mac_bytes > 0:
+            mac = data[:self.mac_bytes]
+            if not nacl.crypto_auth(data[self.mac_bytes:],
+                                self.key)[:self.mac_bytes] == mac:
+                print "Failed MAC verification"
+                return
+        if self.nonce_bytes:
+            nonce_in = data[self.mac_bytes:self.mac_bytes+self.nonce_bytes]
+        else:
+            nonce_in = ''
+        if nonce_in == '\0' * self.nonce_bytes:
+            #print("Key re-exchange time! In")
+            #self.key_get_exchange(data[self.mac_bytes+self.nonce_bytes:])
+            # Disabled because I am incompetent at key re-exchanges
+            return
+        nonce = '\0' + self.nonce_prefix # 1 if client, 0 if server
+        nonce += data[self.mac_bytes:self.mac_bytes+self.nonce_bytes]
+        in_data = data[self.mac_bytes+self.nonce_bytes:]
+        self.recv(nacl.crypto_stream_xor(in_data, nonce, self.key))
+
+    def recv(self, data):
+        print "Received data from %s: %s" % (self.peer_name, repr(data))
+        
+    def send(self, data):
+        if self.nonce_bytes:
+            self.nonce += 1
+            nonce_out = struct.pack("!Q", self.nonce)[-self.nonce_bytes:]
+        else:
+            nonce_out = ''
+        crypted_data = nonce_out + nacl.crypto_stream_xor(data,
+                              '\x01' + self.nonce_prefix + nonce_out, self.key)
+        mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
+        c_sendto(self.sock, mac + crypted_data, self.addr)
+        if nonce_out == '\xff' * self.nonce_bytes: # about to wrap around
+            self.nonce = 0 #nonce 0 should only be used for key exchanges
+            #print("Key re-exchange time! Out")
+            #self.key_exchange()
+            # Disabled because I am incompetent at key re-exchanges
+
+    def key_exchange(self):
+        self.peer_nonce = 0
+        self.kex_init = True
+        print("asdf")
+        nonce_out = '\0' * self.nonce_bytes
+        dhpk, self.dhsk = nacl.crypto_box_keypair()
+        authpkt = nacl.crypto_sign(dhpk, self.secret_key)
+        crypted_data = nonce_out + nacl.crypto_stream_xor(authpkt,
+                              '\x01' + self.nonce_prefix + nonce_out, self.key)
+        mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
+        c_sendto(self.sock, mac + crypted_data, self.addr)
+
+    def key_get_exchange(self):
+        nonce = '\0' * self.nonce_bytes
+        print("asdf2")
+        authpkt = nacl.crypto_stream_xor(data, nonce, self.key)
+        try:
+            peer_dhpk = nacl.crypto_sign_open(authpkt, self.peer_public_key)
+        except Exception:
+            print("Invalid signature from peer \"%s\" from %s" % \
+                                                               (name, addr[0]))
+            sys.exit(0)
+        if self.kex_init:
+            self.key = nacl.crypto_scalarmult(self.dhsk, peer_dhpk)
+            print("New key is %s"%repr(self.key))
+            self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
                                                         "nonce_prefix"),
-                                             self.key)[:31-self.nonce_bytes]
+                                                self.key)[:23-self.nonce_bytes]
+            self.dhsk = None
+            self.kex_init = False
+            return
+        dhpk, dhsk = nacl.crypto_box_keypair()
+        authpkt = nacl.crypto_sign(dhpk, self.secret_key)
+        crypted_data = nonce_out + nacl.crypto_stream_xor(authpkt,
+                                '\x01' + self.nonce_prefix + nonce, self.key)
+        mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
+        c_sendto(self.sock, mac + crypted_data, self.addr)
+        self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
+        print("New key is %s"%repr(self.key))
+        
 
 def sigint_cb(watcher, revents):
     global count_bytes_in, count_bytes_out
