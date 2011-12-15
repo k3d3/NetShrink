@@ -7,7 +7,6 @@ import struct
 import atexit
 from fcntl import ioctl
 from base64 import b64encode, b64decode
-from binascii import hexlify
 if sys.version_info.major == 3:
     import configparser
 else:
@@ -15,7 +14,7 @@ else:
     range = xrange
 from hashlib import sha256
 
-import os as nacl
+import nacl
 import pyev
 
 DEF_PORT=24414
@@ -57,6 +56,15 @@ def save_identity(name, public_key, secret_key):
     a.write(b64encode(public_key)+"\n")
     a.write(b64encode(secret_key)+"\n")
     a.close()
+
+def cidr_to_range(cidr):
+    ip, subnet = cidr.split('/')
+    ip = struct.unpack("!I", socket.inet_aton(ip))[0]
+    #sub = 2**int(subnet)
+    mask = 2 ** (32 - int(subnet)) - 1
+    maxip = ip | mask
+    minip = maxip - mask
+    return minip, maxip
 
 def get_fingerprint(public_key):
     fingerprint = ""
@@ -103,6 +111,8 @@ config = None
 conn_sock = None
 tunfd = None
 ifname = None
+minip = None
+maxip = None
 
 class ServeConnection:
     def __init__(self, sock, addr, peer_name, peer_public_key, peer_dhpk):
@@ -131,8 +141,8 @@ class ServeConnection:
                                                             "nonce_prefix"),
                                                  self.key)[:23]
         self.nonce = 0
-        authpkt = '\0'
-        authpkt += self.name + '\0'
+        authpkt = b'\0'
+        authpkt += self.name + b'\0'
         authpkt += nacl.crypto_sign(dhpk, self.secret_key)
         c_sendto(self.sock, authpkt, self.addr)
     
@@ -167,35 +177,34 @@ class ServeConnection:
         else:
             nonce_out = ''
         crypted_data = nonce_out + nacl.crypto_stream_xor(data,
-                              '\x00' + self.nonce_prefix + nonce_out, self.key)
+                              b'\0' + self.nonce_prefix + nonce_out, self.key)
         mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
         c_sendto(self.sock, mac + crypted_data, self.addr)
-        if nonce_out == '\xff' * self.nonce_bytes: # wrap around
+        if nonce_out == b'\xff' * self.nonce_bytes: # wrap around
             self.nonce = 0 #nonce 0 should only be used for key exchanges
             #print("Key re-exchange time! Out")
             #self.key_exchange()
             # Disabled because I am incompetent at key re-exchanges
 
-    def tun_recv(self, watcher, revents):
+    def tun_recv(self, packet):
         print("Tun Receive")
-        data = os.read
-        print("data is %s" % repr(data))
+        print("data is %s" % repr(packet))
             
     def key_exchange(self):
         self.peer_nonce = 0
         self.kex_init = True
-        nonce_out = '\0' * self.nonce_bytes
+        nonce_out = b'\0' * self.nonce_bytes
         dhpk, self.dhsk = nacl.crypto_box_keypair()
         authpkt = nacl.crypto_sign(dhpk, self.secret_key)
         crypted_data = nonce_out + nacl.crypto_stream_xor(authpkt,
-                              '\0' + self.nonce_prefix + nonce_out, self.key)
+                              b'\0' + self.nonce_prefix + nonce_out, self.key)
         mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
         c_sendto(self.sock, mac + crypted_data, self.addr)
         
     def key_get_exchange(self, data):
-        nonce = '\0' * self.nonce_bytes
+        nonce = b'\0' * self.nonce_bytes
         authpkt = nacl.crypto_stream_xor(data,
-                                         '\x01' + self.nonce_prefix + nonce,
+                                         b'\x01' + self.nonce_prefix + nonce,
                                          self.key)
         try:
             peer_dhpk = nacl.crypto_sign_open(authpkt, self.peer_public_key)
@@ -215,7 +224,7 @@ class ServeConnection:
         dhpk, dhsk = nacl.crypto_box_keypair()
         authpkt = nacl.crypto_sign(dhpk, self.secret_key)
         crypted_data = nonce + nacl.crypto_stream_xor(authpkt,
-                                '\0' + self.nonce_prefix + nonce, self.key)
+                                b'\0' + self.nonce_prefix + nonce, self.key)
         mac = nacl.crypto_auth(crypted_data, self.key)[:self.mac_bytes]
         c_sendto(self.sock, mac + crypted_data, self.addr)
         self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
@@ -236,16 +245,16 @@ class Connection:
         self.nonce = 0
         self.peer_nonce = 0
         self.kex_init = False
-        authpkt = '\0' + self.name + '\0'
+        authpkt = b'\0' + self.name.encode("utf8") + b'\0'
         authpkt += nacl.crypto_sign(dhpk, self.secret_key)
         c_sendto(self.sock, authpkt, self.addr)
         while True:
             data, inaddr = c_recvfrom(self.sock, 4096)
-            if data[0] != '\0':
+            if int(data[0]) != 0:
                 print("Ignoring garbage data from %s" % inaddr[0])
                 continue
-            name_end = data.find('\0', 1)
-            self.peer_name = data[1:name_end]
+            name_end = data.find(b'\0', 1)
+            self.peer_name = data[1:name_end].encode("utf8")
             kexpkt = data[name_end+1:]
             if not peer_exists(self.name):
                 print("Peer \"%s\" is unknown, but you are whitelisted." % \
@@ -319,7 +328,6 @@ class Connection:
     def key_exchange(self):
         self.peer_nonce = 0
         self.kex_init = True
-        print("asdf")
         nonce_out = '\0' * self.nonce_bytes
         dhpk, self.dhsk = nacl.crypto_box_keypair()
         authpkt = nacl.crypto_sign(dhpk, self.secret_key)
@@ -330,7 +338,6 @@ class Connection:
 
     def key_get_exchange(self):
         nonce = '\0' * self.nonce_bytes
-        print("asdf2")
         authpkt = nacl.crypto_stream_xor(data, nonce, self.key)
         try:
             peer_dhpk = nacl.crypto_sign_open(authpkt, self.peer_public_key)
@@ -340,7 +347,6 @@ class Connection:
             sys.exit(0)
         if self.kex_init:
             self.key = nacl.crypto_scalarmult(self.dhsk, peer_dhpk)
-            print("New key is %s"%repr(self.key))
             self.nonce_prefix = nacl.crypto_auth(config.get("netshrink",
                                                         "nonce_prefix"),
                                                 self.key)[:23-self.nonce_bytes]
@@ -355,7 +361,6 @@ class Connection:
         c_sendto(self.sock, mac + crypted_data, self.addr)
         self.key = nacl.crypto_scalarmult(dhsk, peer_dhpk)
         print("New key is %s"%repr(self.key))
-        
 
 def sigint_cb(watcher, revents):
     global count_bytes_in, count_bytes_out
@@ -365,14 +370,21 @@ def sigint_cb(watcher, revents):
     watcher.loop.stop()
     os._exit(0)
 
+def tun_cb(watcher, revents):
+    global tunfd
+    print("Got a tun event")
+    data = os.read(tunfd, 1504)
+    print("Data is %s" % repr(data))
+
 def serve_cb(watcher, revents):
     global connection_map, conn_sock
     data, addr = c_recvfrom(conn_sock, 4096)
     if addr not in connection_map:
-        if data[0] != '\0': # DH Key Exchange Packet
+        print("data0 is %d" % data[0])
+        if int(data[0]) != 0: # DH Key Exchange Packet
             print("Ignoring garbage data from %s" % addr[0])
             return # Ignore this connection
-        name_end = data.find("\0", 1)
+        name_end = data.find(b'\0', 1)
         name = data[1:name_end]
         kexpkt = data[name_end+1:]
         if not peer_exists(name, pfile=WHITELIST_FILE):
@@ -415,7 +427,6 @@ def serve(address="0.0.0.0",port=24414):
     sigint.start()
     print("Starting tun interface...")
     iface_name = config.get("netshrink", "iface_name").encode("utf8")
-    print("iface_name is %s" % iface_name)
     #start the tun interface
     try:
         tunfd = os.open("/dev/net/tun", os.O_RDWR)
@@ -425,7 +436,6 @@ def serve(address="0.0.0.0",port=24414):
         print("You do not have permissions to create a tunnel interface.")
         sys.exit(1)
     ifname = ifname[:ifname.find(b'\0')]
-    print("ifname is %s" % ifname)
     tunio = pyev.Io(tunfd, pyev.EV_READ, loop, tun_cb)
     tunio.start()
     print("Listening for new connections")
