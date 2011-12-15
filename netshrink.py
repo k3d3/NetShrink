@@ -5,12 +5,17 @@ import sys
 import socket
 import struct
 import atexit
+from fcntl import ioctl
 from base64 import b64encode, b64decode
 from binascii import hexlify
-import ConfigParser as configparser
+if sys.version_info.major == 3:
+    import configparser
+else:
+    import ConfigParser as configparser
+    range = xrange
 from hashlib import sha256
 
-import nacl
+import os as nacl
 import pyev
 
 DEF_PORT=24414
@@ -22,6 +27,9 @@ ip_header_size = 20
 udp_header_size = 8
 count_bytes_in = 0
 count_bytes_out = 0
+
+TUNSETIFF = 0x400454ca
+IFF_TUN   = 0x0001
 
 def c_recvfrom(sock, length):
     global count_bytes_in
@@ -37,14 +45,14 @@ def c_sendto(sock, data, addr):
 def load_identity():
     if not os.path.exists(IDENTITY_FILE):
         return None, None, None
-    name, public_key, secret_key = open(IDENTITY_FILE).readlines()
-    name = name[:-1] # Removing the \n from the end
+    name, public_key, secret_key = open(IDENTITY_FILE, "rb").readlines()
+    name = name[:-1].decode("utf8") # Removing the \n from the end
     public_key = b64decode(public_key[:-1])
     secret_key = b64decode(secret_key[:-1])
     return name, public_key, secret_key
     
 def save_identity(name, public_key, secret_key):
-    a=open(IDENTITY_FILE,"w")
+    a=open(IDENTITY_FILE,"wb")
     a.write(name+"\n")
     a.write(b64encode(public_key)+"\n")
     a.write(b64encode(secret_key)+"\n")
@@ -53,7 +61,7 @@ def save_identity(name, public_key, secret_key):
 def get_fingerprint(public_key):
     fingerprint = ""
     pkh = sha256(public_key).hexdigest().upper()
-    for i in xrange(0,32,2):
+    for i in range(0,32,2):
         fingerprint += pkh[i:i+2]+":"
     return fingerprint[:-1]
     
@@ -93,6 +101,8 @@ def save_peer(peer_name, peer_public_key, pfile=PEER_FILE):
 connection_map = {}
 config = None
 conn_sock = None
+tunfd = None
+ifname = None
 
 class ServeConnection:
     def __init__(self, sock, addr, peer_name, peer_public_key, peer_dhpk):
@@ -131,7 +141,7 @@ class ServeConnection:
             mac = data[:self.mac_bytes]
             if not nacl.crypto_auth(data[self.mac_bytes:],
                                 self.key)[:self.mac_bytes] == mac:
-                print "Failed MAC verification"
+                print("Failed MAC verification")
                 return
         if self.nonce_bytes:
             nonce_in = data[self.mac_bytes:self.mac_bytes+self.nonce_bytes]
@@ -148,7 +158,7 @@ class ServeConnection:
         self.recv(nacl.crypto_stream_xor(in_data, nonce, self.key))
     
     def recv(self, data):
-        print "Received data from %s: %s" % (self.peer_name, repr(data))
+        print("Received data from %s: %s" % (self.peer_name, repr(data)))
 
     def send(self, data):
         if self.nonce_bytes:
@@ -166,6 +176,11 @@ class ServeConnection:
             #self.key_exchange()
             # Disabled because I am incompetent at key re-exchanges
 
+    def tun_recv(self, watcher, revents):
+        print("Tun Receive")
+        data = os.read
+        print("data is %s" % repr(data))
+            
     def key_exchange(self):
         self.peer_nonce = 0
         self.kex_init = True
@@ -266,7 +281,7 @@ class Connection:
             mac = data[:self.mac_bytes]
             if not nacl.crypto_auth(data[self.mac_bytes:],
                                 self.key)[:self.mac_bytes] == mac:
-                print "Failed MAC verification"
+                print("Failed MAC verification")
                 return
         if self.nonce_bytes:
             nonce_in = data[self.mac_bytes:self.mac_bytes+self.nonce_bytes]
@@ -283,7 +298,7 @@ class Connection:
         self.recv(nacl.crypto_stream_xor(in_data, nonce, self.key))
 
     def recv(self, data):
-        print "Received data from %s: %s" % (self.peer_name, repr(data))
+        print("Received data from %s: %s" % (self.peer_name, repr(data)))
         
     def send(self, data):
         if self.nonce_bytes:
@@ -374,13 +389,13 @@ def serve_cb(watcher, revents):
         connection_map[addr] = ServeConnection(conn_sock, addr, name,
                                           peer_public_key, result)
     else:
-        print "packet from %s" % addr[0]
+        print("packet from %s" % addr[0])
         connection_map[addr].raw_recv(data)
 
 # COMMANDS
     
 def serve(address="0.0.0.0",port=24414):
-    global config, conn_sock
+    global config, conn_sock, ifname, tunfd
     name, public_key, secret_key = load_identity()
     if name is not None:
         print("Your identity is:")
@@ -388,7 +403,7 @@ def serve(address="0.0.0.0",port=24414):
         print("Verify this fingerprint is valid when connecting")
     else:
         name, public_key, secret_key = new_key_interface()
-    config = configparser.SafeConfigParser()
+    config = configparser.RawConfigParser()
     config.read("netshrink.cfg")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     conn_sock = sock
@@ -398,6 +413,21 @@ def serve(address="0.0.0.0",port=24414):
     io.start()
     sigint = pyev.Signal(2, loop, sigint_cb)
     sigint.start()
+    print("Starting tun interface...")
+    iface_name = config.get("netshrink", "iface_name").encode("utf8")
+    print("iface_name is %s" % iface_name)
+    #start the tun interface
+    try:
+        tunfd = os.open("/dev/net/tun", os.O_RDWR)
+        ifname = ioctl(tunfd, TUNSETIFF,
+                       struct.pack("16sH", iface_name, IFF_TUN))
+    except IOError:
+        print("You do not have permissions to create a tunnel interface.")
+        sys.exit(1)
+    ifname = ifname[:ifname.find(b'\0')]
+    print("ifname is %s" % ifname)
+    tunio = pyev.Io(tunfd, pyev.EV_READ, loop, tun_cb)
+    tunio.start()
     print("Listening for new connections")
     loop.start()
 
@@ -410,7 +440,7 @@ def connect(address, port=24414):
         print("Verify this fingerprint is valid when connecting")
     else:
         name, public_key, secret_key = new_key_interface()
-    config = configparser.SafeConfigParser()
+    config = configparser.RawConfigParser()
     config.read("netshrink.cfg")
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     loop = pyev.default_loop()
@@ -469,7 +499,7 @@ def getpeer(address="0.0.0.0",port=DEF_PORT):
     while True:
         data, addr = c_recvfrom(sock, 4096)
         if data[0] != '\x01': # addpeer packet
-            print "Garbage packet ignored from %s" % addr[0]
+            print("Garbage packet ignored from %s" % addr[0])
             continue
         print("Got identity from %s" % addr[0])
         outdata = "\x02" + public_key + name
